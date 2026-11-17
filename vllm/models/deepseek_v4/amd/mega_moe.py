@@ -10,7 +10,12 @@ import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
+from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    eplb_map_to_physical_and_record,
+)
 from vllm.model_executor.layers.quantization.online.base import (
     ONLINE_SHARED_EXPERT_QUANTIZERS,
 )
@@ -21,6 +26,18 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2, prev_power_of_2
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+logger = init_logger(__name__)
+
+
+def _fanout_pair_config(runtime: Any) -> torch.Tensor | None:
+    """AITER MegaMoEV2's runtime fanout-pair table, or None if absent."""
+    workspace = getattr(runtime, "_s1_dispatch_workspace", None)
+    if not isinstance(workspace, dict):
+        return None
+    pair_config = workspace.get("fanout_pair_config")
+    return pair_config if isinstance(pair_config, torch.Tensor) else None
 
 
 @triton.jit
@@ -95,6 +112,17 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.prefix = prefix
+        # With EPLB, turn off AITER's runtime fanout pairs: compact dispatch
+        # sends a token routed to the two busiest experts of a destination rank
+        # once, into a group segment padded to its own tiles and sent by one
+        # producer. Decode batches rarely hit both experts, and once EPLB spreads
+        # the hot experts every rank gets such a pair, which adds a Stage1 tail.
+        # Measured on DeepSeek-V4.1-Flash, 8x MI355X DP8/EP8 with EPLB: ITL p50
+        # -2.8% instead of -1.1% at 64 requests per rank, -5.9% instead of
+        # -5.2% at 192; no effect without EPLB. The EPLB config is the same on
+        # every rank, so all ranks agree. AITER has no public switch, so forward
+        # zeroes the pair table in the dispatch workspace before each launch.
+        self.disable_fanout_pairs = vllm_config.parallel_config.enable_eplb
 
         def make_param(rows: int, cols: int) -> nn.Parameter:
             param = nn.Parameter(
@@ -110,6 +138,8 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         self.w2_weight_scale = make_param(hidden_size, intermediate_size // 32)
         # (max_tok_per_rank, runtime), ascending by capacity.
         self._runtimes: list[tuple[int, Any]] = []
+        # Inert until EPLB registers the layer (set_eplb_state).
+        self.eplb_state = EplbLayerState()
 
     def weight_loader(
         self,
@@ -219,6 +249,11 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 max_tok_per_rank=max_tok_per_rank,
                 swiglu_limit=self.swiglu_limit,
             )
+            if self.disable_fanout_pairs and _fanout_pair_config(runtime) is None:
+                logger.warning_once(
+                    "AITER MegaMoEV2 has no 'fanout_pair_config' in its dispatch "
+                    "workspace; EPLB runs with AITER fanout pairs on."
+                )
             self._runtime_cache[key] = runtime
         return runtime
 
@@ -235,6 +270,65 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 return runtime
         raise ValueError(
             f"{num_tokens} tokens exceeds MegaMoE capacity {self.max_num_tokens}"
+        )
+
+    def set_eplb_state(
+        self,
+        moe_layer_idx: int,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.eplb_state.set_layer_state(
+            moe_layer_idx,
+            expert_load_view,
+            logical_to_physical_map,
+            logical_replica_count,
+        )
+
+    def get_expert_weights(self) -> list[torch.Tensor]:
+        """Per-expert rows of the finalized weights and scales, for EPLB.
+
+        The a16w4 shuffles only reorder bytes within an expert and keep the
+        tensors expert-major, so EPLB moves an expert as one contiguous row.
+        The fused shared expert's slot stays put. MegaMoEV2 reads the weights
+        by pointer at every launch, so in-place moves keep CUDA graphs valid.
+        """
+        assert self._runtimes, "finalize_weights() must run before EPLB"
+        return [
+            param.data.view(self.num_local_experts, -1)[: self.num_routed_local_experts]
+            for param in (
+                self.w13_weight,
+                self.w13_weight_scale,
+                self.w2_weight,
+                self.w2_weight_scale,
+            )
+        ]
+
+    def update_expert_map(self) -> None:
+        # Physical expert p lives on EP rank p // num_routed_local_experts; no
+        # per-rank expert map to rebuild.
+        pass
+
+    def map_to_physical(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Map logical to physical expert ids and record the expert load when
+        EPLB is on; a no-op otherwise."""
+        eplb_state = self.eplb_state
+        if eplb_state.logical_to_physical_map is None:
+            return topk_ids
+        assert eplb_state.expert_load_view is not None
+        assert eplb_state.logical_replica_count is not None
+        assert eplb_state.should_record_tensor is not None
+        assert eplb_state.num_unpadded_tokens_tensors is not None
+        return eplb_map_to_physical_and_record(
+            topk_ids=topk_ids,
+            expert_load_view=eplb_state.expert_load_view,
+            logical_to_physical_map=eplb_state.logical_to_physical_map,
+            logical_replica_count=eplb_state.logical_replica_count,
+            record_enabled=eplb_state.should_record_tensor,
+            num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
+                dbo_current_ubatch_id()
+            ],
         )
 
     def append_shared_expert(
@@ -269,11 +363,24 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_ids_physical: bool = False,
     ) -> torch.Tensor:
+        """`topk_ids_physical`: the router already mapped `topk_ids` to EPLB
+        physical experts and recorded the load."""
         assert self._runtimes
+        # Map before choosing the runtime: the fixed-slot decode runtime and
+        # the prefill runtime both dispatch physical ids.
+        if not topk_ids_physical:
+            topk_ids = self.map_to_physical(topk_ids)
         runtime = self.select_runtime(hidden_states.shape[0])
         if self.fuse_shared_expert:
             topk_weights, topk_ids = self.append_shared_expert(topk_weights, topk_ids)
+        if self.disable_fanout_pairs:
+            # The prepare kernel writes the next launch's pairs into the other
+            # half of this table, so clear it before every launch.
+            pair_config = _fanout_pair_config(runtime)
+            if pair_config is not None:
+                pair_config.zero_()
         # MegaMoEV2 reads these per launch; rebind to this layer's experts.
         runtime._s1_w1 = self.w13_weight
         runtime._s1_w1_scale = self.w13_weight_scale

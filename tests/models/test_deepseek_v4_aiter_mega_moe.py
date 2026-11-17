@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.config_utils import (
     is_shared_expert_quant_fse_compatible,
 )
 from vllm.models.deepseek_v4.amd import mega_moe as mega_moe_module
+from vllm.models.deepseek_v4.amd import model as amd_model_module
 from vllm.models.deepseek_v4.amd.mega_moe import (
     DeepseekV4AiterMegaMoEExperts,
 )
@@ -46,7 +47,8 @@ def _make_experts(
         ),
     )
     vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens)
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens),
+        parallel_config=SimpleNamespace(enable_eplb=False),
     )
     return DeepseekV4AiterMegaMoEExperts(
         vllm_config,
@@ -173,6 +175,110 @@ def test_mega_moe_shared_expert_fusion_requires_mxfp4_target(
     assert compatible is fused
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("fuse_shared_expert", [False, True])
+def test_eplb_weight_views_alias_routed_slots(monkeypatch, fuse_shared_expert):
+    experts = _make_experts(
+        monkeypatch, ep_size=2, num_experts=4, fuse_shared_expert=fuse_shared_expert
+    )
+    experts._runtimes = [(128, "runtime")]
+    params = (
+        experts.w13_weight,
+        experts.w13_weight_scale,
+        experts.w2_weight,
+        experts.w2_weight_scale,
+    )
+    views = experts.get_expert_weights()
+    assert len(views) == len(params)
+    for view, param in zip(views, params):
+        # One contiguous row per routed expert; the shared slot is not offered.
+        assert view.shape == (2, param.data[0].numel())
+        assert view.is_contiguous()
+        # EPLB writes a moved expert into its row in place.
+        view[1].fill_(7)
+        assert (param.data[1] == 7).all() and (param.data[0] == 0).all()
+        if fuse_shared_expert:
+            assert (param.data[2] == 0).all()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "supports_eplb, num_redundant, elastic_ep, error",
+    [
+        (False, 0, False, "only for DeepSeek-V4.1"),
+        (True, 8, False, "num_redundant_experts=0"),
+        (True, 0, True, "elastic EP"),
+        (True, 0, False, None),
+    ],
+)
+def test_mega_moe_eplb_config_validation(
+    monkeypatch, supports_eplb, num_redundant, elastic_ep, error
+):
+    monkeypatch.setattr(
+        amd_model_module.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True
+    )
+    monkeypatch.setattr(amd_model_module, "on_gfx950", lambda: True)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            all2all_backend="mori",
+            mori_ep_v2=False,
+            enable_eplb=True,
+            eplb_config=SimpleNamespace(num_redundant_experts=num_redundant),
+            enable_elastic_ep=elastic_ep,
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp4")),
+    )
+    validate = amd_model_module._validate_aiter_mega_moe_config
+    if error is None:
+        validate(vllm_config, supports_eplb)
+    else:
+        with pytest.raises(NotImplementedError, match=error):
+            validate(vllm_config, supports_eplb)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="Requires ROCm")
+def test_eplb_maps_to_physical_and_records_unpadded_load(monkeypatch):
+    num_experts, num_tokens, num_unpadded = 384, 37, 30
+    experts = _make_experts(monkeypatch, ep_size=8, num_experts=num_experts)
+    ids = torch.randint(0, num_experts, (num_tokens, 2), device="cuda")
+    ids = ids.to(torch.int32)
+    # Without EPLB the ids pass through.
+    assert experts.map_to_physical(ids) is ids
+
+    perm = torch.randperm(num_experts, device="cuda")
+    load = torch.zeros(1, num_experts, dtype=torch.int32, device="cuda")
+    experts.set_eplb_state(
+        0,
+        expert_load_view=load,
+        logical_to_physical_map=perm.view(1, num_experts, 1),
+        logical_replica_count=torch.ones(
+            1, num_experts, dtype=torch.long, device="cuda"
+        ),
+    )
+    experts.eplb_state.should_record_tensor = torch.ones(
+        (), dtype=torch.bool, device="cuda"
+    )
+    experts.eplb_state.num_unpadded_tokens_tensors = [
+        torch.tensor(num_unpadded, dtype=torch.int32, device="cuda")
+    ]
+
+    out = experts.map_to_physical(ids)
+    assert out.dtype == torch.int32
+    torch.testing.assert_close(out.long(), perm[ids.long()])
+    # Load is recorded per physical expert, for the unpadded rows only.
+    expected = torch.bincount(
+        perm[ids[:num_unpadded].long()].flatten(), minlength=num_experts
+    )
+    torch.testing.assert_close(load[0].long(), expected)
+
+    experts.eplb_state.should_record_tensor.fill_(False)
+    experts.map_to_physical(ids)
+    torch.testing.assert_close(load[0].long(), expected)
+
+
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="Requires ROCm")
 def test_shared_expert_route_appended(monkeypatch):
     experts = _make_experts(
@@ -274,3 +380,123 @@ def test_mega_moe_routing_matches_reference(
         atol=1e-4,
     )
     torch.testing.assert_close(out, 5 * x)
+
+
+@pytest.fixture
+def mori_single_rank():
+    """A one-rank process group with MoRI shmem, as MegaMoEV2 needs."""
+    import torch.distributed as dist
+
+    mori_shmem = pytest.importorskip("mori.shmem")
+    from vllm.utils.network_utils import get_open_port
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl",
+        init_method=f"tcp://127.0.0.1:{get_open_port()}",
+        rank=0,
+        world_size=1,
+        device_id=device,
+    )
+    torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
+    mori_shmem.shmem_torch_process_group_init("default")
+    yield dist.group.WORLD
+    mori_shmem.shmem_finalize()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and amd_model_module.on_gfx950()),
+    reason="Requires ROCm gfx950",
+)
+def test_eplb_inplace_expert_move_keeps_cuda_graph_output(
+    monkeypatch, mori_single_rank
+):
+    """EPLB moves experts by copying their weight rows in place. MegaMoEV2 must
+    read the moved weights on CUDA graph replay (no cached per-expert copy):
+    after permuting the experts and routing to their new slots, the replayed
+    output must match the one before the move."""
+    aiter = pytest.importorskip("aiter")
+    from aiter import dtypes
+
+    # DeepSeek-V4.1-Flash expert shape; 48 experts as one EP8 rank holds.
+    hidden, inter, num_experts, top_k, num_tokens = 5120, 2304, 48, 6, 96
+    monkeypatch.setattr(
+        mega_moe_module,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            rank_in_group=0, world_size=1, cpu_group=mori_single_rank
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+        parallel_config=SimpleNamespace(enable_eplb=True),
+    )
+    experts = DeepseekV4AiterMegaMoEExperts(
+        vllm_config,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        swiglu_limit=10.0,
+    ).cuda()
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    quantize = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+    for weight, scale, rows, cols in (
+        (experts.w13_weight, experts.w13_weight_scale, 2 * inter, hidden),
+        (experts.w2_weight, experts.w2_weight_scale, hidden, inter),
+    ):
+        for e in range(num_experts):
+            w = torch.randn(
+                rows, cols, dtype=torch.bfloat16, device="cuda", generator=generator
+            )
+            q, s = quantize(w * cols**-0.25, quant_dtype=dtypes.fp4x2)
+            weight.data[e].copy_(q.view(torch.uint8).view(rows, cols // 2))
+            scale.data[e].copy_(s.view(torch.uint8).view(rows, cols // 32))
+    experts.finalize_weights()
+
+    x = torch.randn(
+        num_tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    scores = torch.randn(num_tokens, num_experts, device="cuda", generator=generator)
+    topk_weights, logical_ids = scores.softmax(dim=-1).topk(top_k, dim=-1)
+    topk_weights = topk_weights.contiguous()
+    logical_ids = logical_ids.to(torch.int32)
+    ids = logical_ids.clone()
+
+    def run():
+        return experts.forward(x, topk_weights, ids, topk_ids_physical=True)
+
+    eager_before = run().clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    graph.replay()
+    torch.cuda.synchronize()
+    before = out.clone()
+    torch.testing.assert_close(before, eager_before)
+
+    # Physical slot p now holds logical expert perm[p], as EPLB would leave it.
+    perm = torch.randperm(num_experts, device="cuda", generator=generator)
+    for rows in experts.get_expert_weights():
+        rows.copy_(rows[perm].clone())
+    slot_of = torch.empty_like(perm)
+    slot_of[perm] = torch.arange(num_experts, device="cuda")
+
+    # Stale ids now hit other experts: the check below can tell a move apart.
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.allclose(out, before)
+
+    ids.copy_(slot_of[logical_ids.long()].to(torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, before)
+    torch.testing.assert_close(run(), before)
